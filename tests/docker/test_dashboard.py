@@ -16,36 +16,14 @@ import json
 import subprocess
 import time
 
-from tests.docker.conftest import docker_exec, docker_exec_sh
-
-
-def _poll(container: str, probe: str, *, deadline_s: float = 30.0,
-          interval_s: float = 0.5) -> tuple[bool, str]:
-    """Repeatedly run ``probe`` inside the container until it exits 0 or
-    ``deadline_s`` elapses. Returns (success, last stdout)."""
-    end = time.monotonic() + deadline_s
-    last = ""
-    while time.monotonic() < end:
-        r = docker_exec_sh(container, probe, timeout=10)
-        last = r.stdout
-        if r.returncode == 0:
-            return True, last
-        time.sleep(interval_s)
-    return False, last
+from tests.docker.conftest import docker_exec, docker_exec_sh, start_container, poll_container
 
 
 def test_dashboard_not_running_by_default(
     built_image: str, container_name: str,
 ) -> None:
     """Without HERMES_DASHBOARD, no dashboard process should be running."""
-    subprocess.run(
-        ["docker", "run", "-d", "--name", container_name, built_image,
-         "sleep", "60"],
-        check=True, capture_output=True, timeout=30,
-    )
-    # Give the entrypoint enough time to finish bootstrap; if a dashboard
-    # were going to start it'd be visible by now.
-    time.sleep(5)
+    start_container(built_image, container_name, cmd="sleep 60")
     r = docker_exec(container_name, "pgrep", "-f", "hermes dashboard")
     # pgrep exits non-zero when no match found
     assert r.returncode != 0, (
@@ -64,12 +42,7 @@ def test_dashboard_slot_reports_down_when_disabled(
     writes a `down` marker file in the live service-dir when
     HERMES_DASHBOARD is unset, so the slot reflects reality.
     """
-    subprocess.run(
-        ["docker", "run", "-d", "--name", container_name, built_image,
-         "sleep", "60"],
-        check=True, capture_output=True, timeout=30,
-    )
-    time.sleep(5)
+    start_container(built_image, container_name, cmd="sleep 60")
     # /command/ isn't on PATH for docker-exec sessions, so call by
     # absolute path.
     r = docker_exec(
@@ -135,7 +108,7 @@ def test_dashboard_opt_in_starts(
     # Poll for the dashboard subprocess to appear — the entrypoint
     # backgrounds it and bootstrap (skills sync etc.) can take a few
     # seconds before the python process actually launches.
-    ok, _ = _poll(
+    ok, _ = poll_container(
         container_name, "pgrep -f 'hermes dashboard'", deadline_s=30.0,
     )
     assert ok, "Dashboard should be running with HERMES_DASHBOARD=1"
@@ -160,7 +133,7 @@ def test_dashboard_port_override(
     # to the port yet — uvicorn takes another second or two to come up.
     # The image doesn't ship ss/netstat, so probe /proc/net/tcp directly:
     # port 9120 = 0x23A0, state 0A = LISTEN.
-    ok, stdout = _poll(
+    ok, stdout = poll_container(
         container_name,
         "grep -E ' 0+:23A0 .* 0A ' /proc/net/tcp /proc/net/tcp6 "
         "2>/dev/null",
@@ -193,7 +166,7 @@ def test_dashboard_restarts_after_crash(
         check=True, capture_output=True, timeout=30,
     )
     # Wait for the first dashboard to come up.
-    ok, _ = _poll(
+    ok, _ = poll_container(
         container_name, "pgrep -f 'hermes dashboard'", deadline_s=30.0,
     )
     assert ok, "Dashboard never started initially"
@@ -409,7 +382,7 @@ def test_dashboard_insecure_env_var_no_longer_bypasses_gate(
     # Fail-closed: the dashboard process must NOT successfully serve. Probe
     # for a few seconds; /api/status should never become reachable because
     # start_server raised SystemExit before binding.
-    ok, _ = _poll(
+    ok, _ = poll_container(
         container_name,
         "curl -fsS -m 2 http://127.0.0.1:9119/api/status >/dev/null 2>&1",
         deadline_s=12.0,
