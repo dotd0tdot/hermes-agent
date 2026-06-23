@@ -722,9 +722,9 @@ def test_load_enabled_toolsets_rejects_disabled_mcp_env(monkeypatch, capsys):
         config_mod, "load_config", lambda: {"platform_toolsets": {"cli": ["memory"]}}
     )
 
-    # Sorted: ["kanban", "memory", "project"]. `kanban` and `project` are
-    # auto-recovered by _get_platform_tools — both are non-configurable platform
-    # toolsets whose tools live in hermes-cli's universe (see toolsets.py).
+    # Sorted: ["kanban", "memory", "project"]. `kanban` is auto-recovered by
+    # _get_platform_tools (a non-configurable platform toolset in hermes-cli's
+    # universe); `project` is GUI-only, folded in by _load_enabled_toolsets.
     assert server._load_enabled_toolsets() == ["kanban", "memory", "project"]
     err = capsys.readouterr().err
     assert "ignoring disabled MCP servers" in err

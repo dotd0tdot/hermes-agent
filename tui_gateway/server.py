@@ -2297,12 +2297,18 @@ def _load_enabled_toolsets() -> list[str] | None:
         # list without baking in implicit MCP defaults. Using the wrong
         # variant at agent creation time makes MCP tools silently missing
         # from the TUI. See PR #3252 for the original design split.
-        enabled = sorted(
-            _get_platform_tools(cfg, "cli", include_default_mcp_servers=True)
-        )
+        enabled = _get_platform_tools(cfg, "cli", include_default_mcp_servers=True)
         if fallback_notice is not None:
             print(fallback_notice, file=sys.stderr, flush=True)
-        return enabled or None
+        if not enabled:
+            return None
+        # The desktop Project tools are off _HERMES_CORE_TOOLS (every other
+        # platform would carry their schema for nothing), so the platform
+        # recovery above — which keys off hermes-cli's tool universe — can't
+        # surface them. This resolver runs ONLY in the desktop/TUI gateway, so
+        # folding in the `project` toolset here is the gate that exposes them on
+        # exactly the surface that can follow a project move.
+        return sorted(enabled | {"project"})
     except Exception:
         if fallback_notice is not None:
             print(
