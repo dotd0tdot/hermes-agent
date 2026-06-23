@@ -9,10 +9,10 @@ from pathlib import Path
 from unittest.mock import patch
 
 import pytest
-
 from tools.autonomous_loop import (
     AutonomousLoop,
     BacklogReader,
+    ResultValidator,
     SystemScanner,
     _make_task,
 )
@@ -56,12 +56,20 @@ class TestMakeTask:
         assert t["source"] == "auto_detect"
         assert t["attempts"] == 0
         assert t["status"] == "pending"
+        assert "subtasks" not in t
 
     def test_custom_fields(self):
         t = _make_task("id2", "Custom", 5, "backlog", attempts=2, status="running", error="oops")
         assert t["attempts"] == 2
         assert t["status"] == "running"
         assert t["error"] == "oops"
+
+    def test_with_subtasks(self):
+        sub1 = _make_task("s1", "Step 1", 5, "decompose")
+        sub2 = _make_task("s2", "Step 2", 5, "decompose")
+        t = _make_task("parent", "Parent task", 5, "decompose", subtasks=[sub1, sub2])
+        assert len(t["subtasks"]) == 2
+        assert t["subtasks"][0]["id"] == "s1"
 
 
 # ---------------------------------------------------------------------------
@@ -74,6 +82,7 @@ class TestStateManagement:
         assert state["status"] == "idle"
         assert state["iteration"] == 0
         assert state["max_iterations"] == 5
+        assert "execution_history" in state
 
     def test_save_and_load_state(self, loop):
         loop.state["status"] = "running"
@@ -102,6 +111,10 @@ class TestSystemScanner:
         problems = loop.scanner.scan()
         # Should return a list (possibly empty)
         assert isinstance(problems, list)
+
+    def test_scan_ids(self, loop):
+        ids = loop.scanner.scan_ids()
+        assert isinstance(ids, set)
 
     def test_detects_failed_systemd_service(self, tmp_hermes_home):
         scanner = SystemScanner(tmp_hermes_home)
@@ -191,6 +204,66 @@ class TestBacklogReader:
 
 
 # ---------------------------------------------------------------------------
+# ResultValidator
+# ---------------------------------------------------------------------------
+
+class TestResultValidator:
+    def test_baseline_and_validate_resolved(self, tmp_hermes_home):
+        scanner = SystemScanner(tmp_hermes_home)
+        validator = ResultValidator(scanner)
+
+        # Baseline has one problem
+        with patch.object(scanner, "scan_ids", return_value={"problem-1"}):
+            validator.take_baseline()
+
+        # After execution, problem is gone
+        with patch.object(scanner, "scan_ids", return_value=set()):
+            result = validator.validate("problem-1")
+
+        assert result["verified"] is True
+        assert result["resolved"] is True
+        assert result["new_problems"] == []
+
+    def test_baseline_and_validate_not_resolved(self, tmp_hermes_home):
+        scanner = SystemScanner(tmp_hermes_home)
+        validator = ResultValidator(scanner)
+
+        # Baseline has one problem
+        with patch.object(scanner, "scan_ids", return_value={"problem-1"}):
+            validator.take_baseline()
+
+        # After execution, problem still exists
+        with patch.object(scanner, "scan_ids", return_value={"problem-1"}):
+            result = validator.validate("problem-1")
+
+        assert result["verified"] is True
+        assert result["resolved"] is False
+        assert result["new_problems"] == []
+
+    def test_validates_new_problems(self, tmp_hermes_home):
+        scanner = SystemScanner(tmp_hermes_home)
+        validator = ResultValidator(scanner)
+
+        with patch.object(scanner, "scan_ids", return_value={"problem-1"}):
+            validator.take_baseline()
+
+        # New problem appeared
+        with patch.object(scanner, "scan_ids", return_value={"problem-1", "problem-2"}):
+            result = validator.validate("problem-1")
+
+        assert result["verified"] is True
+        assert result["resolved"] is False
+        assert "problem-2" in result["new_problems"]
+
+    def test_no_baseline(self, tmp_hermes_home):
+        scanner = SystemScanner(tmp_hermes_home)
+        validator = ResultValidator(scanner)
+
+        result = validator.validate("problem-1")
+        assert result["verified"] is False
+
+
+# ---------------------------------------------------------------------------
 # Task selection (NBA)
 # ---------------------------------------------------------------------------
 
@@ -244,7 +317,7 @@ class TestTaskSelection:
     def test_uses_task_generator(self, loop):
         loop.scanner.scan = lambda: []
         loop.backlog.read = lambda: []
-        loop.task_generator = lambda: [
+        loop.task_generator = lambda history: [
             _make_task("gen-1", "AI task", 6, "ai_generated"),
         ]
 
@@ -252,6 +325,46 @@ class TestTaskSelection:
         assert task is not None
         assert task["source"] == "ai_generated"
         assert task["title"] == "AI task"
+
+    def test_task_generator_receives_history(self, loop):
+        loop.scanner.scan = lambda: []
+        loop.backlog.read = lambda: []
+        loop.state["execution_history"] = [{"task_id": "old", "success": True}]
+
+        received_history = []
+        def gen(history):
+            received_history.extend(history)
+            return [_make_task("gen-1", "AI task", 6, "ai_generated")]
+
+        loop.task_generator = gen
+        loop._select_next_task()
+        assert len(received_history) == 1
+        assert received_history[0]["task_id"] == "old"
+
+
+# ---------------------------------------------------------------------------
+# Task decomposition
+# ---------------------------------------------------------------------------
+
+class TestTaskDecomposition:
+    def test_expand_without_subtasks(self, loop):
+        task = _make_task("t1", "Simple task", 5, "backlog")
+        result = loop._expand_task(task)
+        assert len(result) == 1
+        assert result[0]["id"] == "t1"
+
+    def test_expand_with_subtasks(self, loop):
+        sub1 = {"title": "Step 1"}
+        sub2 = {"title": "Step 2"}
+        task = _make_task("parent", "Parent", 5, "decompose", subtasks=[sub1, sub2])
+
+        result = loop._expand_task(task)
+        assert len(result) == 2
+        assert result[0]["id"] == "parent-sub0"
+        assert result[0]["title"] == "Step 1"
+        assert result[0]["_parent_id"] == "parent"
+        assert result[1]["id"] == "parent-sub1"
+        assert result[1]["title"] == "Step 2"
 
 
 # ---------------------------------------------------------------------------
@@ -325,6 +438,83 @@ class TestMainLoop:
         summary = loop.run(mock_execute)
         assert summary["failed"] >= 1
 
+    def test_loop_executes_subtasks(self, loop):
+        sub1 = {"title": "Step 1"}
+        sub2 = {"title": "Step 2"}
+        task = _make_task("parent", "Decomposed", 5, "decompose", subtasks=[sub1, sub2])
+
+        loop.scanner.scan = lambda: [task]
+        loop.backlog.read = lambda: []
+
+        executed = []
+
+        def mock_execute(t):
+            executed.append(t["title"])
+            return {"success": True, "message": "ok"}
+
+        loop.state["iteration"] = 2
+        summary = loop.run(mock_execute)
+        # Both subtasks should execute
+        assert "Step 1" in executed
+        assert "Step 2" in executed
+
+    def test_loop_stops_subtasks_on_failure(self, loop):
+        sub1 = {"title": "Step 1"}
+        sub2 = {"title": "Step 2"}
+        sub3 = {"title": "Step 3"}
+        task = _make_task("parent", "Decomposed", 5, "decompose",
+                          subtasks=[sub1, sub2, sub3])
+
+        loop.scanner.scan = lambda: [task]
+        loop.backlog.read = lambda: []
+
+        executed = []
+
+        def mock_execute(t):
+            executed.append(t["title"])
+            if t["title"] == "Step 2":
+                return {"success": False, "message": "fail"}
+            return {"success": True, "message": "ok"}
+
+        loop.state["iteration"] = 2
+        loop.run(mock_execute)
+        # Step 1 and 2 run, Step 3 skipped (parent not executed by execute_fn)
+        assert executed == ["Step 1", "Step 2"]
+
+    def test_loop_parallel_execution(self, loop):
+        loop.max_workers = 2
+        loop.scanner.scan = lambda: [
+            _make_task("t1", "Task A", 10, "auto_detect"),
+            _make_task("t2", "Task B", 10, "auto_detect"),
+        ]
+        loop.backlog.read = lambda: []
+
+        executed = []
+
+        def mock_execute(t):
+            executed.append(t["id"])
+            return {"success": True, "message": "ok"}
+
+        # Even iteration triggers batch mode
+        loop.state["iteration"] = 2
+        summary = loop.run(mock_execute)
+        assert summary["completed"] >= 2
+
+    def test_execution_history_recorded(self, loop):
+        loop.scanner.scan = lambda: [
+            _make_task("task-1", "Do something", 10, "auto_detect"),
+        ]
+        loop.backlog.read = lambda: []
+
+        loop.state["iteration"] = 2
+        loop.run(lambda t: {"success": True, "message": "done"})
+
+        history = loop.state["execution_history"]
+        assert len(history) >= 1
+        assert history[0]["task_id"] == "task-1"
+        assert history[0]["success"] is True
+        assert "validated" in history[0]
+
 
 # ---------------------------------------------------------------------------
 # External control
@@ -339,6 +529,12 @@ class TestExternalControl:
 
         loop.stop()
         assert not loop.is_running()
+
+    def test_stop_sets_event(self, loop):
+        loop.state["status"] = "running"
+        assert not loop._stop_event.is_set()
+        loop.stop()
+        assert loop._stop_event.is_set()
 
     def test_load_status(self, tmp_hermes_home):
         # No state file yet

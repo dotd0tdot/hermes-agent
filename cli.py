@@ -7637,15 +7637,30 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin):
 
             turn_route = cli_self._resolve_turn_agent_config("autonomous task")
 
-            def generate_tasks():
-                """Ask the agent what tasks to work on next."""
+            def generate_tasks(history=None):
+                """Ask the agent what tasks to work on next.
+
+                Args:
+                    history: List of past execution records for feedback.
+                """
+                history_text = ""
+                if history:
+                    recent = history[-5:]  # Last 5 entries
+                    history_text = "\n\nRecent execution history:\n"
+                    for h in recent:
+                        status = "✓" if h.get("success") else "✗"
+                        validated = " (verified)" if h.get("validated") else ""
+                        history_text += f"  {status} {h['title']} — {h.get('message', '')[:80]}{validated}\n"
+                    history_text += "\nDon't repeat tasks that already succeeded. Focus on new or unresolved issues."
+
                 gen_prompt = (
                     "You are an autonomous agent. Analyze the current system state and suggest "
                     "2-3 concrete tasks to work on. Consider:\n"
                     "- Recent git changes that need attention\n"
                     "- Code quality improvements\n"
                     "- Documentation gaps\n"
-                    "- System maintenance\n\n"
+                    "- System maintenance\n"
+                    f"{history_text}\n\n"
                     "Reply ONLY with a JSON array of task objects, each with:\n"
                     '- "title": brief task description\n'
                     '- "priority": 1-10 (10=critical)\n\n'
