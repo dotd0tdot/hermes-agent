@@ -2856,6 +2856,20 @@ DEFAULT_CONFIG = {
     },
 
 
+    # Autonomous loop configuration
+    "autonomous": {
+        # Maximum iterations per /auto session
+        "max_iterations": 50,
+        # Stop after N consecutive failures
+        "max_consecutive_failures": 3,
+        # Sleep after successful task (seconds)
+        "sleep_on_success_s": 30,
+        # Sleep after failed task (seconds)
+        "sleep_on_failure_s": 180,
+        # System scan interval (every N iterations)
+        "scan_interval_s": 60,
+    },
+
     # Config schema version - bump this when adding new required fields
     "_config_version": 30,
 }

@@ -15,6 +15,7 @@ Import discipline (mirrors gateway/slash_commands.py, PR #41886):
 from __future__ import annotations
 
 import json
+import logging
 import os
 import sys
 import threading
@@ -22,6 +23,8 @@ import time
 import uuid
 from datetime import datetime
 from urllib.parse import urlparse
+
+logger = logging.getLogger(__name__)
 
 from rich import box as rich_box
 from rich.markup import escape as _escape
@@ -293,6 +296,65 @@ class CLICommandsMixin:
 
         agent_running = getattr(self, "_agent_running", False)
         _cprint(f"  Agent: {'running' if agent_running else 'idle'}")
+
+    def _handle_ideas_command(self, cmd_original: str) -> None:
+        """Handle /ideas — scan codebase and generate improvement ideas."""
+        from cli import _cprint
+
+        # Parse arguments
+        parts = cmd_original.split()
+        args = parts[1:] if len(parts) > 1 else []
+
+        project = "hermes"
+        scope = "full"
+        target = None
+        show_history = False
+        apply_id = None
+
+        i = 0
+        while i < len(args):
+            a = args[i]
+            if a == "--local":
+                scope = "local"
+            elif a == "--file" and i + 1 < len(args):
+                i += 1
+                target = args[i]
+                scope = "file"
+            elif a == "--history":
+                show_history = True
+            elif a == "--apply" and i + 1 < len(args):
+                i += 1
+                try:
+                    apply_id = int(args[i])
+                except ValueError:
+                    _cprint(f"  Invalid idea ID: {args[i]}")
+                    return
+            elif not a.startswith("--"):
+                project = a
+            i += 1
+
+        if apply_id is not None:
+            # Apply specific idea
+            from hermes_agent.ideas import apply_idea
+            result = apply_idea(apply_id, project)
+            _cprint(result)
+            return
+
+        # Run idea generation
+        from hermes_agent.ideas import run_ideas_command
+        try:
+            result = run_ideas_command(
+                project=project,
+                scope=scope,
+                target=target,
+                show_history=show_history,
+            )
+            _cprint(result)
+        except FileNotFoundError as e:
+            _cprint(f"  {e}")
+        except Exception as e:
+            _cprint(f"  Error: {e}")
+            logger.exception("Ideas command failed")
 
     def _handle_paste_command(self):
         """Handle /paste — explicitly check clipboard for an image.
