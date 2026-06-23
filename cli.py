@@ -7347,6 +7347,304 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin):
                 return
             self._close_model_picker()
 
+    def _handle_autonomous_command(self, cmd_original: str):
+        """Handle /auto — start/stop the autonomous action loop.
+
+        Usage:
+          /auto              — start the loop (default subcommand)
+          /auto start        — start the loop explicitly
+          /auto stop         — stop a running loop
+          /auto status       — show current loop state
+        """
+        parts = cmd_original.strip().split()
+        subcmd = parts[1].lower() if len(parts) > 1 else "start"
+
+        if subcmd == "stop":
+            self._handle_autonomous_stop()
+        elif subcmd == "status":
+            self._handle_autonomous_status()
+        elif subcmd in ("start", ""):
+            self._handle_autonomous_start()
+        else:
+            _cprint(f"  Unknown subcommand: /auto {subcmd}")
+            _cprint("  Usage: /auto [start|stop|status]")
+
+    def _handle_autonomous_start(self):
+        """Start the autonomous loop in a background thread.
+
+        Follows the same pattern as /background — spawns the loop in
+        a daemon thread with its own AIAgent per task. No re-entrancy.
+        """
+        from tools.autonomous_loop import AutonomousLoop
+
+        existing = getattr(self, "_autonomous_loop", None)
+        if existing is not None and existing.is_running():
+            _cprint("  ⚠ Autonomous loop is already running. Use /auto stop first.")
+            return
+
+        # Load config overrides
+        auto_conf = self.config.get("autonomous", {}) if hasattr(self, "config") else {}
+        max_iterations = auto_conf.get("max_iterations", 50)
+        max_failures = auto_conf.get("max_consecutive_failures", 3)
+
+        if not self._ensure_runtime_credentials():
+            _cprint("  ✗ Cannot start autonomous loop: no valid credentials.")
+            return
+
+        self._background_task_counter = getattr(self, "_background_task_counter", 0)
+        _cprint("  ⚡ Autonomous loop starting in background thread...")
+        _cprint(f"    Max iterations: {max_iterations}")
+        _cprint(f"    Max consecutive failures: {max_failures}")
+        _cprint("    Use /auto stop to halt.\n")
+
+        # Capture references for the background thread
+        cli_self = self
+
+        def run_loop():
+            """Background thread: runs the autonomous loop."""
+            from tools.autonomous_loop import AutonomousLoop
+
+            turn_route = cli_self._resolve_turn_agent_config("autonomous task")
+
+            def generate_tasks():
+                """Ask the agent what tasks to work on next."""
+                gen_prompt = (
+                    "You are an autonomous agent. Analyze the current system state and suggest "
+                    "2-3 concrete tasks to work on. Consider:\n"
+                    "- Recent git changes that need attention\n"
+                    "- Code quality improvements\n"
+                    "- Documentation gaps\n"
+                    "- System maintenance\n\n"
+                    "Reply ONLY with a JSON array of task objects, each with:\n"
+                    '- "title": brief task description\n'
+                    '- "priority": 1-10 (10=critical)\n\n'
+                    "Example: [{\"title\": \"Fix failing test\", \"priority\": 8}]\n"
+                    "No other text. Just the JSON array."
+                )
+
+                try:
+                    gen_agent = AIAgent(
+                        model=turn_route["model"],
+                        api_key=turn_route["runtime"].get("api_key"),
+                        base_url=turn_route["runtime"].get("base_url"),
+                        provider=turn_route["runtime"].get("provider"),
+                        api_mode=turn_route["runtime"].get("api_mode"),
+                        max_iterations=10,
+                        enabled_toolsets=["terminal", "file"],
+                        quiet_mode=True,
+                        session_id=f"auto_gen_{int(time.time())}",
+                        platform="cli",
+                        session_db=cli_self._session_db,
+                        reasoning_config=cli_self.reasoning_config,
+                        service_tier=cli_self.service_tier,
+                        request_overrides=turn_route.get("request_overrides"),
+                        providers_allowed=cli_self._providers_only,
+                        providers_ignored=cli_self._providers_ignore,
+                        providers_order=cli_self._providers_order,
+                        provider_sort=cli_self._provider_sort,
+                        provider_require_parameters=cli_self._provider_require_params,
+                        provider_data_collection=cli_self._provider_data_collection,
+                        openrouter_min_coding_score=cli_self._openrouter_min_coding_score,
+                        fallback_model=cli_self._fallback_model,
+                    )
+
+                    result = gen_agent.run_conversation(user_message=gen_prompt)
+                    response = result.get("final_response", "") if result else ""
+
+                    if not response:
+                        return []
+
+                    # Parse JSON array from response
+                    import json as _json
+                    # Try to extract JSON from the response
+                    text = response.strip()
+                    # Handle markdown code blocks
+                    if "```" in text:
+                        import re
+                        match = re.search(r"```(?:json)?\s*\n?(.*?)\n?\s*```", text, re.DOTALL)
+                        if match:
+                            text = match.group(1).strip()
+                    # Find JSON array
+                    start = text.find("[")
+                    end = text.rfind("]") + 1
+                    if start >= 0 and end > start:
+                        text = text[start:end]
+
+                    tasks_data = _json.loads(text)
+                    result_tasks = []
+                    for i, t in enumerate(tasks_data):
+                        title = t.get("title", f"Generated task {i+1}")
+                        priority = t.get("priority", 5)
+                        result_tasks.append({
+                            "id": f"gen_{i+1}_{int(time.time())}",
+                            "title": title,
+                            "priority": min(max(int(priority), 1), 10),
+                            "source": "ai_generated",
+                            "attempts": 0,
+                            "status": "pending",
+                            "error": "",
+                        })
+                    return result_tasks
+
+                except Exception as e:
+                    print(f"  ⚠ Task generation failed: {e}")
+                    return []
+
+            def execute_callback(task):
+                """Run a single task with a fresh AIAgent."""
+                task_num = cli_self._background_task_counter + 1
+                cli_self._background_task_counter = task_num
+                task_id = f"auto_{task_num}_{task.get('id', '?')}"
+
+                title = task.get("title", "Unknown task")
+                context = task.get("context", "")
+
+                # Print task header
+                print()
+                print(f"  ⚡ Task #{task_num}: {title}")
+                if context:
+                    print(f"     Context: {context[:120]}")
+
+                # Build task prompt
+                task_prompt = (
+                    f"Autonomous task [{task_id}]:\n"
+                    f"{title}\n"
+                )
+                if context:
+                    task_prompt += f"\nContext: {context}\n"
+                task_prompt += (
+                    "\nExecute this task using your tools (terminal, file, patch, etc.).\n"
+                    "When done, provide a brief summary."
+                )
+
+                try:
+                    bg_agent = AIAgent(
+                        model=turn_route["model"],
+                        api_key=turn_route["runtime"].get("api_key"),
+                        base_url=turn_route["runtime"].get("base_url"),
+                        provider=turn_route["runtime"].get("provider"),
+                        api_mode=turn_route["runtime"].get("api_mode"),
+                        acp_command=turn_route["runtime"].get("command"),
+                        acp_args=turn_route["runtime"].get("args"),
+                        max_tokens=turn_route["runtime"].get("max_tokens"),
+                        max_iterations=cli_self.max_turns,
+                        enabled_toolsets=cli_self.enabled_toolsets,
+                        quiet_mode=True,
+                        verbose_logging=False,
+                        session_id=task_id,
+                        platform="cli",
+                        session_db=cli_self._session_db,
+                        reasoning_config=cli_self.reasoning_config,
+                        service_tier=cli_self.service_tier,
+                        request_overrides=turn_route.get("request_overrides"),
+                        providers_allowed=cli_self._providers_only,
+                        providers_ignored=cli_self._providers_ignore,
+                        providers_order=cli_self._providers_order,
+                        provider_sort=cli_self._provider_sort,
+                        provider_require_parameters=cli_self._provider_require_params,
+                        provider_data_collection=cli_self._provider_data_collection,
+                        openrouter_min_coding_score=cli_self._openrouter_min_coding_score,
+                        fallback_model=cli_self._fallback_model,
+                    )
+                    # Show tool progress in the TUI spinner
+                    def _auto_thinking(text: str) -> None:
+                        if not cli_self._agent_running:
+                            cli_self._spinner_text = text
+                            if cli_self._app:
+                                cli_self._app.invalidate()
+                    bg_agent.thinking_callback = _auto_thinking
+
+                    result = bg_agent.run_conversation(
+                        user_message=task_prompt,
+                        task_id=task_id,
+                    )
+
+                    response = result.get("final_response", "") if result else ""
+                    if not response and result and result.get("error"):
+                        response = f"Error: {result['error']}"
+
+                    if response:
+                        print(f"  ✓ Done: {response[:150]}")
+                        return {"success": True, "message": response[:200]}
+                    else:
+                        print(f"  ⚠ Empty response")
+                        return {"success": False, "message": "Empty response"}
+
+                except Exception as e:
+                    error_msg = f"{type(e).__name__}: {e}"
+                    print(f"  ✗ Failed: {error_msg}")
+                    return {"success": False, "message": error_msg}
+
+            # Create the autonomous loop with task generator
+            try:
+                loop = AutonomousLoop(
+                    max_iterations=cli_self.config.get("autonomous", {}).get("max_iterations", 50) if hasattr(cli_self, "config") else 50,
+                    max_consecutive_failures=cli_self.config.get("autonomous", {}).get("max_consecutive_failures", 3) if hasattr(cli_self, "config") else 3,
+                    task_generator=generate_tasks,
+                )
+                cli_self._autonomous_loop = loop
+            except Exception as e:
+                print(f"  ✗ Failed to initialize autonomous loop: {e}")
+                return
+
+            # Run the loop
+            summary = {"status": "unknown"}
+            try:
+                summary = loop.run(execute_callback)
+            except Exception as e:
+                print(f"  ✗ Loop error: {e}")
+
+            # Print summary
+            print()
+            print(f"  {'='*50}")
+            print(f"  Autonomous loop finished: {summary.get('status', 'unknown')}")
+            print(f"    Iterations: {summary.get('iterations', 0)}")
+            print(f"    Completed:  {summary.get('completed', 0)}")
+            print(f"    Failed:     {summary.get('failed', 0)}")
+            print(f"    Duration:   {summary.get('duration_s', 0)}s")
+            print(f"  {'='*50}")
+            print()
+
+            cli_self._autonomous_loop = None
+
+        # Start in daemon thread (same pattern as /background)
+        thread = threading.Thread(target=run_loop, daemon=True, name="autonomous-loop")
+        thread.start()
+
+    def _handle_autonomous_stop(self):
+        """Request the running loop to stop after the current iteration."""
+        loop = getattr(self, "_autonomous_loop", None)
+        if loop is not None and loop.is_running():
+            loop.stop()
+            _cprint("  ⏹ Stop signal sent to autonomous loop.")
+        else:
+            _cprint("  No autonomous loop is currently running.")
+
+    def _handle_autonomous_status(self):
+        """Show current autonomous loop status."""
+        from tools.autonomous_loop import AutonomousLoop
+
+        loop = getattr(self, "_autonomous_loop", None)
+        if loop is not None and loop.is_running():
+            state = loop.state
+            _cprint(f"  Status: {_DIM}running{_RST}")
+            _cprint(f"    Iteration: {state.get('iteration', 0)}/{state.get('max_iterations', '?')}")
+            _cprint(f"    Completed: {len(state.get('completed_tasks', []))}")
+            _cprint(f"    Failed: {len(state.get('failed_tasks', []))}")
+            _cprint(f"    Consecutive failures: {state.get('consecutive_failures', 0)}")
+            current = state.get("current_task")
+            if current:
+                _cprint(f"    Current: {current.get('title', '?')}")
+        else:
+            # Check for persisted state from a previous run
+            state = AutonomousLoop.load_status()
+            if state.get("status") != "idle":
+                _cprint(f"  Status: {_DIM}{state.get('status', 'unknown')}{_RST} (persisted)")
+                _cprint(f"    Last iteration: {state.get('last_iteration_at', '?')}")
+                _cprint(f"    Completed: {len(state.get('completed_tasks', []))}")
+            else:
+                _cprint("  No autonomous loop is currently running.")
+
     def _handle_model_switch(self, cmd_original: str):
         """Handle /model command — switch model.
 
@@ -8142,10 +8440,14 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin):
             self._handle_snapshot_command(cmd_original)
         elif canonical == "stop":
             self._handle_stop_command()
+        elif canonical == "ideas":
+            self._handle_ideas_command(cmd_original)
         elif canonical == "agents":
             self._handle_agents_command()
         elif canonical == "background":
             self._handle_background_command(cmd_original)
+        elif canonical == "auto":
+            self._handle_autonomous_command(cmd_original)
         elif canonical == "queue":
             # Extract prompt after "/queue " or "/q "
             parts = cmd_original.split(None, 1)
