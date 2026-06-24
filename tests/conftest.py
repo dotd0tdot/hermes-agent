@@ -199,6 +199,11 @@ _HERMES_BEHAVIORAL_VARS = frozenset({
     "HERMES_BACKGROUND_NOTIFICATIONS",
     "HERMES_EXEC_ASK",
     "HERMES_HOME_MODE",
+    # Subprocess HOME isolation state.  If the developer shell has this
+    # set (e.g. from a parent Hermes subprocess), it leaks into tests and
+    # shadows the test's own HOME/HERMES_HOME in get_real_home() /
+    # _iter_real_home_candidates.
+    "HERMES_REAL_HOME",
     "HERMES_AGENT_USE_LEGACY_SESSION_KEYS",
     # Kanban path/board pins must never leak from a developer shell or
     # dispatched worker into tests; otherwise tests can write fake tasks to

@@ -540,6 +540,10 @@ def get_subprocess_home(env: dict[str, str] | None = None) -> str | None:
 
 def apply_subprocess_home_env(env: dict[str, str]) -> None:
     """Apply Hermes' subprocess HOME contract to *env* in-place."""
+    # Discard any inherited HERMES_REAL_HOME — it may be stale from a
+    # parent process that ran the same function.  We compute it afresh
+    # from the current HOME / HERMES_HOME state.
+    env.pop("HERMES_REAL_HOME", None)
     real_home = get_real_home(env)
     if real_home:
         env["HERMES_REAL_HOME"] = real_home
