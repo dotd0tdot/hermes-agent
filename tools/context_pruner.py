@@ -137,6 +137,13 @@ _CONTEXT_IRRELEVANT_TOOLSETS: Dict[RuntimeContext, Set[str]] = {
     RuntimeContext.GATEWAY_DISCORD: {
         # Mirror telegram — keep send_message, drop platform-specifics
     },
+    RuntimeContext.GATEWAY_SLACK: set(),
+    RuntimeContext.GATEWAY_WHATSAPP: set(),
+    RuntimeContext.GATEWAY_SIGNAL: set(),
+    RuntimeContext.GATEWAY_FEISHU: set(),
+    RuntimeContext.GATEWAY_MATRIX: set(),
+    RuntimeContext.GATEWAY_WECOM: set(),
+    RuntimeContext.GATEWAY_YUANBAO: set(),
     RuntimeContext.GATEWAY_GENERIC: {},
     RuntimeContext.KANBAN_WORKER: {
         "computer_use",

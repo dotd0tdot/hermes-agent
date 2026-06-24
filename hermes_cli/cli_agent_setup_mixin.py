@@ -405,6 +405,12 @@ class CLIAgentSetupMixin:
             # Route agent status output through prompt_toolkit so ANSI escape
             # sequences aren't garbled by patch_stdout's StdoutProxy (#2262).
             self.agent._print_fn = _cprint
+            # Tool execution optimizations: read from config.yaml
+            #   execution.max_concurrent_tools (default 8)
+            #   execution.per_tool_timeout_seconds (default 0 = no timeout)
+            from cli import CLI_CONFIG as _cfg_exec
+            self.agent.max_concurrent_tools = int(_cfg_exec.get("execution", {}).get("max_concurrent_tools", 8))
+            self.agent.per_tool_timeout_seconds = float(_cfg_exec.get("execution", {}).get("per_tool_timeout_seconds", 0))
             # Hydrate credits notices at session OPEN (parity with the TUI), so a
             # depletion / usage-band warning shows before the first message. The
             # notice_callback is bound above → _on_notice renders the line. Idempotent
