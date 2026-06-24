@@ -667,7 +667,12 @@ def execute_tool_calls_concurrent(agent, assistant_message, messages: list, effe
                 logger.info("tool %s failed (%.2fs): %s", function_name, duration, result[:200])
             else:
                 logger.info("tool %s completed (%.2fs, %d chars)", function_name, duration, len(result))
-            results[index] = (function_name, function_args, result, duration, is_error, False, middleware_trace)
+            # Don't overwrite a result already set by timeout or cancel.
+            # The worker may outlive the per-tool timeout check (f.cancel()
+            # does not stop a running thread), so we must respect the
+            # timeout/cancelled result already written by the main thread.
+            if results[index] is None:
+                results[index] = (function_name, function_args, result, duration, is_error, False, middleware_trace)
         finally:
             # Tear down worker-tid tracking.  Clear any interrupt bit we may
             # have set so the next task scheduled onto this recycled tid
@@ -723,6 +728,14 @@ def execute_tool_calls_concurrent(agent, assistant_message, messages: list, effe
                                 False,
                                 middleware_trace,
                             )
+                            _finalize_tool_result(
+                                agent, messages, parsed_calls, results,
+                                effective_task_id, skipped_i, _tc, skipped_name, skipped_args,
+                            )
+                            _flush_session_db_after_tool_progress(
+                                agent, messages,
+                                stage=f"shutdown-error tool result {skipped_name}",
+                            )
                     break
                 futures[f] = (i, tc, name, args)
                 _tool_start_time[f] = time.time()
@@ -737,16 +750,19 @@ def execute_tool_calls_concurrent(agent, assistant_message, messages: list, effe
             _per_tool_timeout = float(getattr(agent, 'per_tool_timeout_seconds', 0))
             while _remaining:
                 done_set = set()
-                for f in concurrent.futures.as_completed(_remaining, timeout=0.5):
-                    done_set.add(f)
-                    _idx, tc, name, args = futures[f]
-                    _finalize_tool_result(
-                        agent, messages, parsed_calls, results,
-                        effective_task_id, _idx, tc, name, args,
-                    )
-                    _flush_session_db_after_tool_progress(
-                        agent, messages, stage=f"tool result {name}",
-                    )
+                try:
+                    for f in concurrent.futures.as_completed(_remaining, timeout=0.5):
+                        done_set.add(f)
+                        _idx, tc, name, args = futures[f]
+                        _finalize_tool_result(
+                            agent, messages, parsed_calls, results,
+                            effective_task_id, _idx, tc, name, args,
+                        )
+                        _flush_session_db_after_tool_progress(
+                            agent, messages, stage=f"tool result {name}",
+                        )
+                except concurrent.futures.TimeoutError:
+                    pass
                 _remaining -= done_set
 
                 if not _remaining:
@@ -790,6 +806,13 @@ def execute_tool_calls_concurrent(agent, assistant_message, messages: list, effe
                                 }, ensure_ascii=False),
                                 _per_tool_timeout, True, False,
                                 parsed_calls[_idx][3],
+                            )
+                            _finalize_tool_result(
+                                agent, messages, parsed_calls, results,
+                                effective_task_id, _idx, tc, name, args,
+                            )
+                            _flush_session_db_after_tool_progress(
+                                agent, messages, stage=f"timed-out tool result {name}",
                             )
                             _remaining.discard(f)
 
