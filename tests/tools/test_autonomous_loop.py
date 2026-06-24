@@ -12,9 +12,11 @@ import pytest
 from tools.autonomous_loop import (
     AutonomousLoop,
     BacklogReader,
+    Planner,
     ResultValidator,
     SystemScanner,
     _make_task,
+    _make_plan,
 )
 
 
@@ -201,6 +203,130 @@ class TestBacklogReader:
     def test_handles_missing_file(self, tmp_hermes_home):
         reader = BacklogReader(tmp_hermes_home / "nonexistent.md")
         assert reader.read() == []
+
+
+# ---------------------------------------------------------------------------
+# Planner
+# ---------------------------------------------------------------------------
+
+class TestPlanner:
+    def test_create_plan(self, tmp_hermes_home):
+        planner = Planner(tmp_hermes_home)
+        steps = [
+            {"title": "Step 1", "description": "First step"},
+            {"title": "Step 2", "description": "Second step"},
+        ]
+        plan = planner.create_plan(goal="Improve code", steps=steps)
+        assert plan["status"] == "active"
+        assert plan["goal"] == "Improve code"
+        assert len(plan["steps"]) == 2
+        assert planner.has_active_plan()
+
+    def test_only_one_active_plan(self, tmp_hermes_home):
+        planner = Planner(tmp_hermes_home)
+        planner.create_plan(goal="Plan A", steps=[{"title": "A1"}])
+        planner.create_plan(goal="Plan B", steps=[{"title": "B1"}])
+        active = planner.active_plan()
+        assert active["goal"] == "Plan B"
+        assert active["status"] == "active"
+        # Old plan should be superseded
+        old = [p for p in planner.plans if p["goal"] == "Plan A"]
+        assert old[0]["status"] == "superseded"
+
+    def test_advance_step(self, tmp_hermes_home):
+        planner = Planner(tmp_hermes_home)
+        planner.create_plan(goal="Test", steps=[
+            {"title": "Step 1"},
+            {"title": "Step 2"},
+        ])
+        step = planner.current_step()
+        assert step["title"] == "Step 1"
+
+        next_step = planner.advance({"success": True, "message": "done"})
+        assert next_step["title"] == "Step 2"
+        assert planner.active_plan()["current_step"] == 1
+
+    def test_advance_completes_plan(self, tmp_hermes_home):
+        planner = Planner(tmp_hermes_home)
+        planner.create_plan(goal="Test", steps=[{"title": "Step 1"}])
+        planner.advance({"success": True, "message": "done"})
+        assert planner.active_plan() is None
+        assert not planner.has_active_plan()
+
+    def test_advance_fails_plan(self, tmp_hermes_home):
+        planner = Planner(tmp_hermes_home)
+        planner.create_plan(goal="Test", steps=[
+            {"title": "Step 1"},
+            {"title": "Step 2"},
+        ])
+        result = planner.advance({"success": False, "message": "error"})
+        assert result is None
+        # active_plan() returns None because status is "failed"
+        assert planner.active_plan() is None
+        # But the plan still exists in history
+        failed = [p for p in planner.plans if p["status"] == "failed"]
+        assert len(failed) == 1
+
+    def test_replan(self, tmp_hermes_home):
+        planner = Planner(tmp_hermes_home)
+        planner.create_plan(goal="Test", steps=[
+            {"title": "Step 1"},
+            {"title": "Step 2"},
+            {"title": "Step 3"},
+        ])
+        planner.advance({"success": True, "message": "done"})
+        # Replan while plan is still active (Step 1 done, Step 2 current)
+        # Now replan: keep Step 1, replace Step 2 and 3
+        next_step = planner.replan(
+            [{"title": "New Step 2"}, {"title": "New Step 3"}],
+            reason="Step 2 was wrong",
+        )
+        assert next_step["title"] == "New Step 2"
+        plan = planner.active_plan()
+        assert len(plan["steps"]) == 3  # Step 1 + 2 new
+        assert plan["replan_count"] == 1
+        assert plan["replan_reasons"][0]["reason"] == "Step 2 was wrong"
+
+    def test_abandon(self, tmp_hermes_home):
+        planner = Planner(tmp_hermes_home)
+        planner.create_plan(goal="Test", steps=[{"title": "Step 1"}])
+        planner.abandon(reason="Not needed")
+        assert planner.active_plan() is None
+
+    def test_persistence(self, tmp_hermes_home):
+        planner = Planner(tmp_hermes_home)
+        planner.create_plan(goal="Test", steps=[
+            {"title": "Step 1"},
+            {"title": "Step 2"},
+        ])
+        planner.advance({"success": True, "message": "done"})
+
+        # Reload
+        planner2 = Planner(tmp_hermes_home)
+        assert planner2.has_active_plan()
+        assert planner2.active_plan()["current_step"] == 1
+
+    def test_active_step_as_task(self, tmp_hermes_home):
+        planner = Planner(tmp_hermes_home)
+        planner.create_plan(goal="Improve hermes", steps=[
+            {"title": "Run linter"},
+            {"title": "Fix errors"},
+        ])
+        task = planner.active_step_as_task()
+        assert task is not None
+        assert "[Improve hermes]" in task["title"]
+        assert "Run linter" in task["title"]
+        assert task["source"] == "plan"
+        assert task["priority"] == 8
+
+    def test_recent_plans(self, tmp_hermes_home):
+        planner = Planner(tmp_hermes_home)
+        planner.create_plan(goal="Plan 1", steps=[{"title": "S1"}])
+        planner.create_plan(goal="Plan 2", steps=[{"title": "S1"}])
+        recent = planner.recent_plans(limit=2)
+        assert len(recent) == 2
+        goals = {p["goal"] for p in recent}
+        assert goals == {"Plan 1", "Plan 2"}
 
 
 # ---------------------------------------------------------------------------
@@ -548,3 +674,129 @@ class TestExternalControl:
         state = AutonomousLoop.load_status(tmp_hermes_home)
         assert state["status"] == "completed"
         assert state["iteration"] == 5
+
+
+# ---------------------------------------------------------------------------
+# Daemon mode (run_forever / _tick)
+# ---------------------------------------------------------------------------
+
+class TestDaemonMode:
+    def test_tick_returns_result(self, loop):
+        loop.scanner.scan = lambda: [
+            _make_task("t1", "Task A", 10, "auto_detect"),
+        ]
+        loop.backlog.read = lambda: []
+        loop.state["iteration"] = 2  # Force scanner
+
+        tick = loop._tick(lambda t: {"success": True, "message": "ok"})
+        assert tick["action"] == "execute"
+        assert tick["success"] is True
+        assert tick["task"] == "Task A"
+
+    def test_tick_idle(self, loop):
+        loop.scanner.scan = lambda: []
+        loop.backlog.read = lambda: []
+
+        tick = loop._tick(lambda t: {"success": True, "message": "ok"})
+        assert tick["action"] == "idle"
+
+    def test_run_forever_stops(self, loop):
+        """run_forever should stop when stop() is called."""
+        loop.backlog.read = lambda: []
+        loop.sleep_on_success_s = 0
+        loop.sleep_on_failure_s = 0
+
+        iterations_done = []
+
+        def mock_execute(t):
+            iterations_done.append(t["id"])
+            if len(iterations_done) >= 2:
+                loop.stop()
+            return {"success": True, "message": "ok"}
+
+        # Return a fresh task each time (so it's not in completed_tasks)
+        call_count = [0]
+        def fresh_scan():
+            call_count[0] += 1
+            return [_make_task(f"t-{call_count[0]}", f"Task {call_count[0]}", 10, "auto_detect")]
+
+        loop.scanner.scan = fresh_scan
+        loop.state["iteration"] = 2
+
+        # run_forever in current thread — should exit after stop()
+        import time
+        start = time.time()
+        loop.run_forever(mock_execute)
+        elapsed = time.time() - start
+
+        assert len(iterations_done) >= 2
+        assert elapsed < 10  # Should not hang
+        assert loop.state["status"] == "stopped"
+
+    def test_run_forever_survives_exceptions(self, loop):
+        """run_forever should keep going after task exceptions."""
+        loop.backlog.read = lambda: []
+        loop.sleep_on_success_s = 0
+        loop.sleep_on_failure_s = 0
+
+        call_count = [0]
+
+        def mock_execute(t):
+            call_count[0] += 1
+            if call_count[0] == 1:
+                raise RuntimeError("boom")
+            if call_count[0] >= 3:
+                loop.stop()
+            return {"success": True, "message": "ok"}
+
+        scan_count = [0]
+        def fresh_scan():
+            scan_count[0] += 1
+            return [_make_task(f"t-{scan_count[0]}", f"Task {scan_count[0]}", 10, "auto_detect")]
+
+        loop.scanner.scan = fresh_scan
+        loop.state["iteration"] = 2
+
+        loop.run_forever(mock_execute)
+        # Should have continued after the exception
+        assert call_count[0] >= 3
+
+    def test_run_forever_idle_sleeps(self, loop):
+        """run_forever should sleep when idle, not spin."""
+        loop.backlog.read = lambda: []
+        loop.sleep_on_success_s = 0.05
+
+        call_count = [0]
+
+        def mock_execute(t):
+            call_count[0] += 1
+            if call_count[0] >= 2:
+                loop.stop()
+            return {"success": True, "message": "ok"}
+
+        # First tick is idle (empty scan), then return fresh tasks
+        scan_count = [0]
+        def smart_scan():
+            scan_count[0] += 1
+            if scan_count[0] >= 2:
+                return [_make_task(f"t-{scan_count[0]}", f"Task {scan_count[0]}", 10, "auto_detect")]
+            return []
+
+        loop.scanner.scan = smart_scan
+        loop.state["iteration"] = 2  # Force scan
+
+        loop.run_forever(mock_execute)
+        assert call_count[0] >= 2  # Should have executed at least twice
+
+    def test_tick_batch_mode(self, loop):
+        loop.max_workers = 2
+        loop.scanner.scan = lambda: [
+            _make_task("t1", "Task A", 10, "auto_detect"),
+            _make_task("t2", "Task B", 10, "auto_detect"),
+        ]
+        loop.backlog.read = lambda: []
+        loop.state["iteration"] = 1  # After increment → 2, 2%2=0 → batch
+
+        tick = loop._tick(lambda t: {"success": True, "message": "ok"})
+        assert tick["action"] == "batch"
+        assert tick["success"] is True

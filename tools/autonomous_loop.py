@@ -14,6 +14,8 @@ Features:
 - **Task decomposition**: tasks may contain ``subtasks`` lists executed sequentially.
 - **Parallel execution**: independent tasks run concurrently via ThreadPoolExecutor.
 - **Feedback loop**: execution history is passed to the task generator.
+- **Self-directed planning**: agent creates multi-step plans with goals, executes
+  them step by step, and replans based on outcomes.
 """
 from __future__ import annotations
 
@@ -24,6 +26,7 @@ import re
 import subprocess
 import threading
 import time
+import uuid
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timezone
 from pathlib import Path
@@ -282,6 +285,185 @@ class BacklogReader:
 
 
 # ---------------------------------------------------------------------------
+# Self-directed planner — creates multi-step plans with goals
+# ---------------------------------------------------------------------------
+
+def _make_plan(
+    goal: str,
+    steps: List[dict],
+    context: str = "",
+    plan_id: Optional[str] = None,
+) -> dict:
+    """Create a plan dict.
+
+    Each step: {"title": str, "description": str, "status": "pending"}
+    """
+    return {
+        "id": plan_id or f"plan-{uuid.uuid4().hex[:12]}",
+        "goal": goal,
+        "created_at": _now_iso(),
+        "status": "active",
+        "current_step": 0,
+        "steps": steps,
+        "context": context,
+        "replan_count": 0,
+    }
+
+
+class Planner:
+    """Manages self-directed plans: create, advance, replan, persist.
+
+    Plans are stored in ``~/.hermes/autonomous-plans.json``.
+    Only one plan can be active at a time.
+    """
+
+    def __init__(self, hermes_home: Path):
+        self.plans_path = hermes_home / "autonomous-plans.json"
+        self.plans: List[dict] = self._load()
+
+    # --- Persistence --------------------------------------------------------
+
+    def _load(self) -> List[dict]:
+        data = _load_json(self.plans_path, {"plans": []})
+        return data.get("plans", [])
+
+    def _save(self) -> None:
+        _save_json(self.plans_path, {"plans": self.plans})
+
+    # --- Active plan --------------------------------------------------------
+
+    def active_plan(self) -> Optional[dict]:
+        """Return the current active plan, or None."""
+        for p in self.plans:
+            if p["status"] == "active":
+                return p
+        return None
+
+    def has_active_plan(self) -> bool:
+        return self.active_plan() is not None
+
+    # --- Create -------------------------------------------------------------
+
+    def create_plan(self, goal: str, steps: List[dict], context: str = "") -> dict:
+        """Create and activate a new plan. Deactivates any existing active plan."""
+        # Deactivate old plan
+        for p in self.plans:
+            if p["status"] == "active":
+                p["status"] = "superseded"
+
+        plan = _make_plan(goal=goal, steps=steps, context=context)
+        self.plans.append(plan)
+        self._save()
+        return plan
+
+    # --- Advance ------------------------------------------------------------
+
+    def current_step(self) -> Optional[dict]:
+        """Return the current step of the active plan, or None."""
+        plan = self.active_plan()
+        if not plan:
+            return None
+        idx = plan["current_step"]
+        if idx < len(plan["steps"]):
+            return plan["steps"][idx]
+        return None
+
+    def advance(self, result: dict) -> Optional[dict]:
+        """Mark current step done, advance to next.
+
+        Args:
+            result: {"success": bool, "message": str}
+
+        Returns:
+            The next step dict, or None if plan is complete.
+        """
+        plan = self.active_plan()
+        if not plan:
+            return None
+
+        idx = plan["current_step"]
+        step = plan["steps"][idx]
+        step["status"] = "completed" if result.get("success") else "failed"
+        step["result"] = result.get("message", "")
+
+        if not result.get("success"):
+            plan["status"] = "failed"
+            self._save()
+            return None
+
+        plan["current_step"] += 1
+
+        # Check if plan is complete
+        if plan["current_step"] >= len(plan["steps"]):
+            plan["status"] = "completed"
+            self._save()
+            return None
+
+        self._save()
+        return plan["steps"][plan["current_step"]]
+
+    # --- Replan -------------------------------------------------------------
+
+    def replan(self, new_steps: List[dict], reason: str = "") -> Optional[dict]:
+        """Replace remaining steps in the active plan.
+
+        Keeps completed steps, replaces pending ones.
+        """
+        plan = self.active_plan()
+        if not plan:
+            return None
+
+        # Keep completed steps
+        completed = [s for s in plan["steps"] if s.get("status") == "completed"]
+        plan["steps"] = completed + new_steps
+        plan["current_step"] = len(completed)
+        plan["replan_count"] = plan.get("replan_count", 0) + 1
+        plan["status"] = "active"
+
+        if reason:
+            plan.setdefault("replan_reasons", []).append({
+                "at": _now_iso(),
+                "reason": reason,
+                "step_index": plan["current_step"],
+            })
+
+        self._save()
+        return plan["steps"][plan["current_step"]] if plan["steps"] else None
+
+    # --- Abandon ------------------------------------------------------------
+
+    def abandon(self, reason: str = "") -> None:
+        """Mark the active plan as abandoned."""
+        plan = self.active_plan()
+        if plan:
+            plan["status"] = "abandoned"
+            plan["abandon_reason"] = reason
+            self._save()
+
+    # --- History ------------------------------------------------------------
+
+    def recent_plans(self, limit: int = 5) -> List[dict]:
+        """Return recent plans (newest first)."""
+        return sorted(self.plans, key=lambda p: p["created_at"], reverse=True)[:limit]
+
+    # --- Task conversion ----------------------------------------------------
+
+    def active_step_as_task(self) -> Optional[dict]:
+        """Convert the current plan step to a task dict for the loop."""
+        plan = self.active_plan()
+        step = self.current_step()
+        if not plan or not step:
+            return None
+
+        return _make_task(
+            id=f"{plan['id']}-step{plan['current_step']}",
+            title=f"[{plan['goal'][:40]}] {step['title']}",
+            priority=8,  # Plans get high priority
+            source="plan",
+        )
+
+
+# ---------------------------------------------------------------------------
 # Result validation
 # ---------------------------------------------------------------------------
 
@@ -339,6 +521,7 @@ class AutonomousLoop:
     - Task decomposition (subtasks)
     - Parallel execution (max_workers)
     - Feedback to task_generator(history)
+    - Self-directed planning via Planner
     """
 
     def __init__(
@@ -350,6 +533,7 @@ class AutonomousLoop:
         sleep_on_failure_s: int = DEFAULT_SLEEP_ON_FAILURE_S,
         scan_interval_s: int = DEFAULT_SCAN_INTERVAL_S,
         task_generator: Optional[Callable[[List[dict]], List[dict]]] = None,
+        plan_generator: Optional[Callable[[List[dict]], Optional[dict]]] = None,
         max_workers: int = DEFAULT_MAX_WORKERS,
     ):
         self.hermes_home = hermes_home or get_hermes_home()
@@ -362,12 +546,14 @@ class AutonomousLoop:
         self.sleep_on_success_s = sleep_on_success_s
         self.sleep_on_failure_s = sleep_on_failure_s
         self.scan_interval_s = scan_interval_s
-        self.max_workers = max_workers
 
         self.scanner = SystemScanner(self.hermes_home)
         self.backlog = BacklogReader(self.backlog_path)
         self.validator = ResultValidator(self.scanner)
+        self.planner = Planner(self.hermes_home)
         self.task_generator = task_generator
+        self.plan_generator = plan_generator
+        self.max_workers = max_workers
         self.state = self._load_state()
         self._stop_event = threading.Event()
 
@@ -401,13 +587,25 @@ class AutonomousLoop:
     # --- Task selection (NBA) ----------------------------------------------
 
     def _select_next_task(self) -> Optional[dict]:
-        """Pick the highest-priority available task."""
-        candidates: List[dict] = []
+        """Pick the highest-priority available task.
+
+        Priority order:
+        1. Active plan step (highest)
+        2. System-detected problems
+        3. Backlog tasks
+        4. AI-generated tasks
+        """
+        # 0. Active plan step (priority 8)
+        plan_task = self.planner.active_step_as_task()
+        if plan_task is not None:
+            return plan_task
 
         # 1. System-detected problems (priority 10)
         if self.state["iteration"] % 3 == 0:  # Scan every 3rd iteration
             detected = self.scanner.scan()
-            candidates.extend(detected)
+            candidates = list(detected)
+        else:
+            candidates = []
 
         # 2. Backlog tasks (priority 5)
         candidates.extend(self.backlog.read())
@@ -423,7 +621,23 @@ class AutonomousLoop:
             except Exception as e:
                 self._log("Task generator failed: %s", e)
 
-        # 4. Fallback — nothing to do
+        # 4. Try to create a plan if nothing to do
+        if not candidates and self.plan_generator is not None and not self.planner.has_active_plan():
+            try:
+                history = self.state.get("execution_history", [])
+                plan = self.plan_generator(history)
+                if plan and plan.get("steps"):
+                    self.planner.create_plan(
+                        goal=plan["goal"],
+                        steps=plan["steps"],
+                        context=plan.get("context", ""),
+                    )
+                    self._log("Created plan: %s (%d steps)", plan["goal"], len(plan["steps"]))
+                    return self.planner.active_step_as_task()
+            except Exception as e:
+                self._log("Plan generator failed: %s", e)
+
+        # 5. Fallback — nothing to do
         if not candidates:
             return None
 
@@ -559,17 +773,160 @@ class AutonomousLoop:
                 results.append((task, result))
         return results
 
-    # --- Main loop ----------------------------------------------------------
+    # --- Single tick (one iteration) ----------------------------------------
+
+    def _tick(self, execute_fn: Callable[[dict], dict]) -> dict:
+        """Execute one iteration. Returns the tick result dict."""
+        self.state["iteration"] += 1
+        self.state["last_iteration_at"] = _now_iso()
+
+        tick_result = {
+            "iteration": self.state["iteration"],
+            "action": None,
+            "task": None,
+            "success": None,
+        }
+
+        # Decide: batch (parallel) or single
+        if self.max_workers > 1 and self.state["iteration"] % 2 == 0:
+            batch = self._select_batch()
+            if not batch:
+                tick_result["action"] = "idle"
+                return tick_result
+
+            self._log(
+                "Iteration %d: batch of %d tasks (parallel)",
+                self.state["iteration"], len(batch),
+            )
+
+            batch_results = self._execute_batch(batch, execute_fn)
+            for task, result in batch_results:
+                self._process_result(task, result)
+            tick_result["action"] = "batch"
+            tick_result["task"] = f"{len(batch)} tasks"
+            tick_result["success"] = all(r.get("success") for _, r in batch_results)
+        else:
+            task = self._select_next_task()
+            if task is None:
+                tick_result["action"] = "idle"
+                return tick_result
+
+            # Expand subtasks
+            subtasks = self._expand_task(task)
+            if len(subtasks) > 1:
+                self._log(
+                    "Iteration %d: [%s] %s → %d subtasks",
+                    self.state["iteration"],
+                    task["source"], task["title"], len(subtasks),
+                )
+            else:
+                self._log(
+                    "Iteration %d: [%s] %s (priority=%d, attempt=%d)",
+                    self.state["iteration"],
+                    task["source"], task["title"], task["priority"],
+                    task.get("attempts", 0) + 1,
+                )
+
+            # Execute subtasks sequentially
+            all_success = True
+            for st in subtasks:
+                result = self._execute_task(st, execute_fn)
+                success = result.get("success", False)
+                self._process_result(st, result)
+                if not success:
+                    all_success = False
+                    break  # Stop subtask chain on failure
+
+            # Record parent task outcome
+            if len(subtasks) > 1:
+                parent_result = {
+                    "success": all_success,
+                    "message": f"{len(subtasks)} subtasks: {'all done' if all_success else 'stopped on failure'}",
+                }
+                self._record_history(task, parent_result)
+                # Mark parent as completed so it's not re-selected
+                task["status"] = "completed"
+                self.state["completed_tasks"].append(task)
+
+            # Advance plan if task was from a plan
+            if task.get("source") == "plan" and self.planner.has_active_plan():
+                step_result = {"success": all_success, "message": task.get("error", "")}
+                next_step = self.planner.advance(step_result)
+                if next_step:
+                    self._log("  → Plan next step: %s", next_step["title"])
+                elif self.planner.active_plan() is None:
+                    self._log("  ✓ Plan completed!")
+
+            tick_result["action"] = "execute"
+            tick_result["task"] = task["title"]
+            tick_result["success"] = all_success
+
+        self._save_state()
+        return tick_result
+
+    # --- Daemon mode (run forever) ------------------------------------------
+
+    def run_forever(self, execute_fn: Callable[[dict], dict]) -> None:
+        """Run the autonomous loop indefinitely until stop() is called.
+
+        This is the daemon mode — call from a daemon thread.
+        Never returns (loops forever).
+        """
+        self.state["status"] = "running"
+        self.state["started_at"] = _now_iso()
+        self._stop_event.clear()
+        self._save_state()
+
+        self._log("Autonomous daemon started (max_workers=%d)", self.max_workers)
+
+        try:
+            while not self._stop_event.is_set():
+                try:
+                    tick = self._tick(execute_fn)
+
+                    # If idle, sleep longer
+                    if tick["action"] == "idle":
+                        self._log("Nothing to do — sleeping %ds", self.sleep_on_success_s)
+                        self._stop_event.wait(self.sleep_on_success_s)
+                        continue
+
+                    # Reset consecutive failures after successful tick
+                    if tick["success"]:
+                        self.state["consecutive_failures"] = 0
+
+                    # Check stop conditions
+                    if self.state["consecutive_failures"] >= self.max_consecutive_failures:
+                        self._log("STOPPED: %d consecutive failures — pausing (not exiting)",
+                                  self.state["consecutive_failures"])
+                        # Reset failures after pause so daemon can retry later
+                        self.state["consecutive_failures"] = 0
+                        self._stop_event.wait(self.sleep_on_failure_s * 5)
+                        continue
+
+                    # Adaptive sleep between ticks
+                    success_last = tick.get("success", False)
+                    sleep_s = self.sleep_on_success_s if success_last else self.sleep_on_failure_s
+                    self._stop_event.wait(sleep_s)
+
+                except Exception as e:
+                    self._log("Tick crashed: %s — retrying in %ds", e, self.sleep_on_failure_s)
+                    self._stop_event.wait(self.sleep_on_failure_s)
+
+        except KeyboardInterrupt:
+            self._log("Interrupted by user (Ctrl+C)")
+            self.state["status"] = "interrupted"
+        finally:
+            self.state["status"] = "stopped"
+            self.state["current_task"] = None
+            self._save_state()
+            self._log("Autonomous daemon stopped")
+
+    # --- Bounded mode (for tests / one-shot) --------------------------------
 
     def run(self, execute_fn: Callable[[dict], dict]) -> dict:
-        """
-        Run the autonomous loop.
+        """Run the autonomous loop for a bounded number of iterations.
 
-        ``execute_fn(task) -> {"success": bool, "message": str}`` is called
-        for each task. It has full access to Hermes tools (terminal, file, etc.)
-        because it runs inside the agent's conversation loop.
-
-        Returns a summary dict.
+        Returns a summary dict. Used by tests and one-shot execution.
         """
         self.state["status"] = "running"
         self.state["started_at"] = _now_iso()
@@ -581,69 +938,12 @@ class AutonomousLoop:
 
         try:
             while self.state["iteration"] < self.max_iterations and not self._stop_event.is_set():
-                self.state["iteration"] += 1
-                self.state["last_iteration_at"] = _now_iso()
+                tick = self._tick(execute_fn)
 
-                # Decide: batch (parallel) or single
-                if self.max_workers > 1 and self.state["iteration"] % 2 == 0:
-                    batch = self._select_batch()
-                    if not batch:
-                        self._log("No tasks remaining — exiting loop")
-                        break
-
-                    self._log(
-                        "Iteration %d/%d: batch of %d tasks (parallel)",
-                        self.state["iteration"], self.max_iterations, len(batch),
-                    )
-
-                    batch_results = self._execute_batch(batch, execute_fn)
-                    for task, result in batch_results:
-                        self._process_result(task, result)
-                else:
-                    task = self._select_next_task()
-                    if task is None:
-                        self._log("No tasks remaining — exiting loop")
-                        break
-
-                    # Expand subtasks
-                    subtasks = self._expand_task(task)
-                    if len(subtasks) > 1:
-                        self._log(
-                            "Iteration %d/%d: [%s] %s → %d subtasks",
-                            self.state["iteration"], self.max_iterations,
-                            task["source"], task["title"], len(subtasks),
-                        )
-                    else:
-                        self._log(
-                            "Iteration %d/%d: [%s] %s (priority=%d, attempt=%d)",
-                            self.state["iteration"], self.max_iterations,
-                            task["source"], task["title"], task["priority"],
-                            task.get("attempts", 0) + 1,
-                        )
-
-                    # Execute subtasks sequentially
-                    all_success = True
-                    for st in subtasks:
-                        result = self._execute_task(st, execute_fn)
-                        success = result.get("success", False)
-                        self._process_result(st, result)
-                        if not success:
-                            all_success = False
-                            break  # Stop subtask chain on failure
-
-                    # Record parent task outcome
-                    if len(subtasks) > 1:
-                        parent_result = {
-                            "success": all_success,
-                            "message": f"{len(subtasks)} subtasks: {'all done' if all_success else 'stopped on failure'}",
-                        }
-                        self._record_history(task, parent_result)
-                        # Mark parent as completed so it's not re-selected
-                        task["status"] = "completed"
-                        self.state["completed_tasks"].append(task)
-
-                # Save after every iteration
-                self._save_state()
+                # If idle, exit (bounded mode)
+                if tick["action"] == "idle":
+                    self._log("No tasks remaining — exiting loop")
+                    break
 
                 # Check stop conditions
                 if self.state["consecutive_failures"] >= self.max_consecutive_failures:
@@ -653,10 +953,9 @@ class AutonomousLoop:
                 # Adaptive sleep (don't sleep after last iteration or if stopping)
                 if (self.state["iteration"] < self.max_iterations
                         and not self._stop_event.is_set()):
-                    success_last = self.state["consecutive_failures"] == 0
+                    success_last = tick.get("success", False)
                     sleep_s = self.sleep_on_success_s if success_last else self.sleep_on_failure_s
                     self._log("  Sleeping %ds...", sleep_s)
-                    # Interruptible sleep
                     self._stop_event.wait(sleep_s)
 
         except KeyboardInterrupt:

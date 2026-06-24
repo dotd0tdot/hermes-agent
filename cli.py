@@ -7736,6 +7736,108 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin):
                     print(f"  ⚠ Task generation failed: {e}")
                     return []
 
+            def generate_plan(history=None):
+                """Ask the agent to create a multi-step plan.
+
+                Args:
+                    history: List of past execution records for feedback.
+
+                Returns:
+                    dict with "goal", "steps" (list of {"title", "description"}),
+                    "context", or None on failure.
+                """
+                history_text = ""
+                if history:
+                    recent = history[-5:]
+                    history_text = "\n\nRecent execution history:\n"
+                    for h in recent:
+                        status = "✓" if h.get("success") else "✗"
+                        history_text += f"  {status} {h['title']} — {h.get('message', '')[:80]}\n"
+
+                plan_prompt = (
+                    "You are an autonomous agent. Analyze the current system and create "
+                    "a multi-step plan to improve it.\n"
+                    "Look at git repos, code quality, documentation, system health.\n"
+                    f"{history_text}\n\n"
+                    "Reply ONLY with a JSON object with:\n"
+                    '- "goal": one-line goal description\n'
+                    '- "steps": array of 3-6 step objects, each with "title" and "description"\n'
+                    '- "context": brief context about why this plan\n\n'
+                    'Example:\n'
+                    '{"goal": "Fix lint errors in hermes-agent", "steps": '
+                    '[{"title": "Run linter", "description": "Identify all warnings"}, '
+                    '{"title": "Fix critical errors", "description": "Fix errors first"}], '
+                    '"context": "System has 47 warnings"}\n'
+                    "No other text. Just the JSON object."
+                )
+
+                try:
+                    gen_agent = AIAgent(
+                        model=turn_route["model"],
+                        api_key=turn_route["runtime"].get("api_key"),
+                        base_url=turn_route["runtime"].get("base_url"),
+                        provider=turn_route["runtime"].get("provider"),
+                        api_mode=turn_route["runtime"].get("api_mode"),
+                        max_iterations=10,
+                        enabled_toolsets=["terminal", "file"],
+                        quiet_mode=True,
+                        session_id=f"auto_plan_{int(time.time())}",
+                        platform="cli",
+                        session_db=cli_self._session_db,
+                        reasoning_config=cli_self.reasoning_config,
+                        service_tier=cli_self.service_tier,
+                        request_overrides=turn_route.get("request_overrides"),
+                        providers_allowed=cli_self._providers_only,
+                        providers_ignored=cli_self._providers_ignore,
+                        providers_order=cli_self._providers_order,
+                        provider_sort=cli_self._provider_sort,
+                        provider_require_parameters=cli_self._provider_require_params,
+                        provider_data_collection=cli_self._provider_data_collection,
+                        openrouter_min_coding_score=cli_self._openrouter_min_coding_score,
+                        fallback_model=cli_self._fallback_model,
+                    )
+
+                    result = gen_agent.run_conversation(user_message=plan_prompt)
+                    response = result.get("final_response", "") if result else ""
+
+                    if not response:
+                        return None
+
+                    import json as _json
+                    text = response.strip()
+                    if "```" in text:
+                        import re
+                        match = re.search(r"```(?:json)?\s*\n?(.*?)\n?\s*```", text, re.DOTALL)
+                        if match:
+                            text = match.group(1).strip()
+                    start = text.find("{")
+                    end = text.rfind("}") + 1
+                    if start >= 0 and end > start:
+                        text = text[start:end]
+
+                    plan_data = _json.loads(text)
+                    goal = plan_data.get("goal", "Autonomous improvement")
+                    steps = plan_data.get("steps", [])
+                    context = plan_data.get("context", "")
+
+                    # Validate steps
+                    valid_steps = []
+                    for s in steps:
+                        if isinstance(s, dict) and "title" in s:
+                            valid_steps.append({
+                                "title": s["title"],
+                                "description": s.get("description", ""),
+                            })
+
+                    if not valid_steps:
+                        return None
+
+                    return {"goal": goal, "steps": valid_steps, "context": context}
+
+                except Exception as e:
+                    print(f"  ⚠ Plan generation failed: {e}")
+                    return None
+
             def execute_callback(task):
                 """Run a single task with a fresh AIAgent."""
                 task_num = cli_self._background_task_counter + 1
@@ -7821,35 +7923,24 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin):
                     print(f"  ✗ Failed: {error_msg}")
                     return {"success": False, "message": error_msg}
 
-            # Create the autonomous loop with task generator
+            # Create the autonomous loop with task generator and plan generator
             try:
                 loop = AutonomousLoop(
                     max_iterations=cli_self.config.get("autonomous", {}).get("max_iterations", 50) if hasattr(cli_self, "config") else 50,
                     max_consecutive_failures=cli_self.config.get("autonomous", {}).get("max_consecutive_failures", 3) if hasattr(cli_self, "config") else 3,
                     task_generator=generate_tasks,
+                    plan_generator=generate_plan,
                 )
                 cli_self._autonomous_loop = loop
             except Exception as e:
                 print(f"  ✗ Failed to initialize autonomous loop: {e}")
                 return
 
-            # Run the loop
-            summary = {"status": "unknown"}
+            # Run the loop (daemon mode — runs forever until stopped)
             try:
-                summary = loop.run(execute_callback)
+                loop.run_forever(execute_callback)
             except Exception as e:
                 print(f"  ✗ Loop error: {e}")
-
-            # Print summary
-            print()
-            print(f"  {'='*50}")
-            print(f"  Autonomous loop finished: {summary.get('status', 'unknown')}")
-            print(f"    Iterations: {summary.get('iterations', 0)}")
-            print(f"    Completed:  {summary.get('completed', 0)}")
-            print(f"    Failed:     {summary.get('failed', 0)}")
-            print(f"    Duration:   {summary.get('duration_s', 0)}s")
-            print(f"  {'='*50}")
-            print()
 
             cli_self._autonomous_loop = None
 
