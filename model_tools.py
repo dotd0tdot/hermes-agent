@@ -245,7 +245,8 @@ _LEGACY_TOOLSET_MAP = {
 # =============================================================================
 
 # Module-level memoization for get_tool_definitions(). Keyed on
-# (frozenset(enabled_toolsets), frozenset(disabled_toolsets), registry._generation).
+# (frozenset(enabled_toolsets), frozenset(disabled_toolsets), registry._generation,
+#  cfg_fp, RuntimeContext, skip_tool_search_assembly).
 # Hot callers (gateway runner, AIAgent.__init__) invoke this on every turn
 # with quiet_mode=True; caching avoids ~7 ms of registry walking + schema
 # filtering + check_fn probing per call. Only active when quiet_mode=True
@@ -313,12 +314,19 @@ def get_tool_definitions(
             cfg_fp = (cfg_stat.st_mtime_ns, cfg_stat.st_size)
         except (FileNotFoundError, OSError, ImportError):
             cfg_fp = None
+        # Runtime context is part of the cache key because
+        # _compute_tool_definitions prunes toolsets per-context via
+        # context_pruner.pruned_toolsets(). Without it, a cache entry
+        # computed for one context (e.g. gateway:telegram) would
+        # incorrectly serve a later call from a different context
+        # (e.g. gateway:discord) that needs different tool pruning.
+        from tools.context_pruner import detect_runtime_context
         cache_key = (
             frozenset(enabled_toolsets) if enabled_toolsets is not None else None,
             frozenset(disabled_toolsets) if disabled_toolsets else None,
             registry._generation,
             cfg_fp,
-            bool(os.environ.get("HERMES_KANBAN_TASK")),
+            detect_runtime_context(),
             bool(skip_tool_search_assembly),
         )
         cached = _tool_defs_cache.get(cache_key)
@@ -370,6 +378,24 @@ def _compute_tool_definitions(
             # (for token/cost reasons), but that should not strip the kanban
             # worker's completion/block/heartbeat surface.
             effective_enabled_toolsets.append("kanban")
+
+        # Context-aware toolset pruning: filter out toolsets that can never
+        # be useful in the current runtime context (CLI, gateway, TUI, etc.).
+        # This reduces token consumption by excluding irrelevant schemas
+        # before they're resolved and sent to the model. The pruning map is
+        # defined in tools/context_pruner.py and is conservative — only
+        # removes toolsets that are explicitly listed as irrelevant.
+        from tools.context_pruner import detect_runtime_context, pruned_toolsets
+        _ctx = detect_runtime_context()
+        _pruned, _removed = pruned_toolsets(effective_enabled_toolsets, _ctx)
+        if _removed:
+            logger.info(
+                "Context-pruned toolsets for %s (auto): %s",
+                _ctx.value,
+                ", ".join(_removed),
+            )
+        effective_enabled_toolsets = _pruned
+
         for toolset_name in effective_enabled_toolsets:
             if validate_toolset(toolset_name):
                 resolved = resolve_toolset(toolset_name)
@@ -384,9 +410,20 @@ def _compute_tool_definitions(
             elif not quiet_mode:
                 print(f"⚠️  Unknown toolset: {toolset_name}")
     else:
-        # Default: start with everything
+        # Default: start with everything, but still skip context-irrelevant
+        # toolsets (e.g. kanban on CLI, computer_use on Linux).
+        from tools.context_pruner import detect_runtime_context, pruned_toolsets
+        _ctx = detect_runtime_context()
         from toolsets import get_all_toolsets
-        for ts_name in get_all_toolsets():
+        _all_ts = list(get_all_toolsets())
+        _pruned, _removed = pruned_toolsets(_all_ts, _ctx)
+        if _removed:
+            logger.info(
+                "Context-pruned toolsets for %s (all): %s",
+                _ctx.value,
+                ", ".join(_removed),
+            )
+        for ts_name in _pruned:
             tools_to_include.update(resolve_toolset(ts_name))
 
     # Always apply disabled toolsets as a subtraction step at the end.
