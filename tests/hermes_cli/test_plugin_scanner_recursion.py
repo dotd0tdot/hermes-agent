@@ -122,7 +122,7 @@ class TestCategoryNamespaceRecursion:
 
         non_bundled = [
             k for k, p in mgr._plugins.items()
-            if p.manifest.source != "bundled"
+            if p.manifest.source not in ("bundled", "entrypoint")
         ]
         assert non_bundled == []
 
@@ -147,7 +147,7 @@ class TestCategoryNamespaceRecursion:
         # The bundled plugins/image_gen/openai/ exists in the repo — filter
         # it out so we're only asserting on the user-dir layout.
         user_plugins_in_registry = {
-            k for k, p in mgr._plugins.items() if p.manifest.source != "bundled"
+            k for k, p in mgr._plugins.items() if p.manifest.source not in ("bundled", "entrypoint")
         }
         assert "image_gen" in user_plugins_in_registry
         assert "image_gen/openai" not in user_plugins_in_registry

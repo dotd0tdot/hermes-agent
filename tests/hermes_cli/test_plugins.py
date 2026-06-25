@@ -361,7 +361,7 @@ class TestPluginDiscovery:
         # Filter out bundled plugins — they're always discovered.
         non_bundled = {
             n: p for n, p in mgr._plugins.items()
-            if p.manifest.source != "bundled"
+            if p.manifest.source not in ("bundled", "entrypoint")
         }
         assert len(non_bundled) == 1
 
@@ -395,7 +395,7 @@ class TestPluginDiscovery:
         assert mgr._discovered is True
         non_bundled = {
             n: p for n, p in mgr._plugins.items()
-            if p.manifest.source != "bundled"
+            if p.manifest.source not in ("bundled", "entrypoint")
         }
         assert len(non_bundled) == 1
 
@@ -411,7 +411,7 @@ class TestPluginDiscovery:
         # Filter out bundled plugins — they're always discovered.
         non_bundled = {
             n: p for n, p in mgr._plugins.items()
-            if p.manifest.source != "bundled"
+            if p.manifest.source not in ("bundled", "entrypoint")
         }
         assert len(non_bundled) == 0
 

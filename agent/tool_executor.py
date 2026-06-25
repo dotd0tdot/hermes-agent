@@ -282,14 +282,18 @@ def _run_agent_tool_execution_middleware(
 
 
 
-def _finalize_tool_result(agent, messages, parsed_calls, results,
-                          effective_task_id, idx, tc, name, args) -> None:
-    """Process and append a single tool result into messages.
+def _process_tool_result(agent, messages, parsed_calls, results,
+                          effective_task_id, idx, tc, name, args) -> str:
+    """Process a single tool result: guardrail observation, callbacks, display, persist.
 
-    Called by execute_tool_calls_concurrent as soon as each tool future
-    completes (via as_completed), rather than batch-processing all results
-    at the end.  This lets fast tools appear in the message list before
-    slow tools finish.
+    Returns ``tool_content`` (a string suitable for the tool result message).
+    Does NOT append to ``messages`` or flush to the session DB — callers
+    that need ordered message-appending should batch ``_append_tool_result``
+    in the desired order after calling this.
+
+    ``_finalize_tool_result`` below is the convenience wrapper that calls
+    this and then appends + flushes immediately (the old behaviour, kept
+    for interrupt / shutdown / timeout paths that don't need ordering).
     """
     _tool_budget = _budget_for_agent(agent)
     r = results[idx]
@@ -362,12 +366,31 @@ def _finalize_tool_result(agent, messages, parsed_calls, results,
     if sd:
         fr = fr + sd if isinstance(fr, str) else fr
 
-    tool_content = agent._tool_result_content_for_active_model(name, fr)
-    messages.append(make_tool_result_message(name, tool_content, tc.id))
+    return agent._tool_result_content_for_active_model(name, fr)
+
+
+def _append_tool_result(agent, messages, name, tc_id, tool_content) -> None:
+    """Append a pre-built tool result message and flush to session DB."""
+    messages.append(make_tool_result_message(name, tool_content, tc_id))
     _flush_session_db_after_tool_progress(
         agent, messages, stage=f"tool result {name}",
     )
     agent._apply_pending_steer_to_tool_results(messages, 1)
+
+
+def _finalize_tool_result(agent, messages, parsed_calls, results,
+                          effective_task_id, idx, tc, name, args) -> None:
+    """Process and append a single tool result into messages.
+
+    Convenience wrapper around ``_process_tool_result`` +
+    ``_append_tool_result``.  Kept for interrupt / shutdown / timeout
+    paths and any caller that does not need ordered message-batching.
+    """
+    tool_content = _process_tool_result(
+        agent, messages, parsed_calls, results,
+        effective_task_id, idx, tc, name, args,
+    )
+    _append_tool_result(agent, messages, name, tc.id, tool_content)
 
 
 def execute_tool_calls_concurrent(agent, assistant_message, messages: list, effective_task_id: str, api_call_count: int = 0) -> None:
@@ -694,6 +717,12 @@ def execute_tool_calls_concurrent(agent, assistant_message, messages: list, effe
         if block_result is None
     ]
     futures: dict = {}
+    # Track tool results for ordered message-appending after concurrent execution.
+    # _pending_append[idx] = (name, tc_id, tool_content) — processed but not yet
+    # appended to messages.  _finalized_indices tracks indices whose
+    # _finalize_tool_result was already called (shutdown error path).
+    _pending_append: dict[int, tuple[str, str, str]] = {}
+    _finalized_indices: set[int] = set()
     if runnable_calls:
         max_workers = min(len(runnable_calls), getattr(agent, 'max_concurrent_tools', _MAX_TOOL_WORKERS))
         with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
@@ -732,10 +761,7 @@ def execute_tool_calls_concurrent(agent, assistant_message, messages: list, effe
                                 agent, messages, parsed_calls, results,
                                 effective_task_id, skipped_i, _tc, skipped_name, skipped_args,
                             )
-                            _flush_session_db_after_tool_progress(
-                                agent, messages,
-                                stage=f"shutdown-error tool result {skipped_name}",
-                            )
+                            _finalized_indices.add(skipped_i)
                     break
                 futures[f] = (i, tc, name, args)
                 _tool_start_time[f] = time.time()
@@ -754,13 +780,11 @@ def execute_tool_calls_concurrent(agent, assistant_message, messages: list, effe
                     for f in concurrent.futures.as_completed(_remaining, timeout=0.5):
                         done_set.add(f)
                         _idx, tc, name, args = futures[f]
-                        _finalize_tool_result(
+                        tool_content = _process_tool_result(
                             agent, messages, parsed_calls, results,
                             effective_task_id, _idx, tc, name, args,
                         )
-                        _flush_session_db_after_tool_progress(
-                            agent, messages, stage=f"tool result {name}",
-                        )
+                        _pending_append[_idx] = (name, tc.id, tool_content)
                 except concurrent.futures.TimeoutError:
                     pass
                 _remaining -= done_set
@@ -783,10 +807,11 @@ def execute_tool_calls_concurrent(agent, assistant_message, messages: list, effe
                     for f in list(_remaining):
                         if f.done():
                             _idx, tc, name, args = futures[f]
-                            _finalize_tool_result(
+                            tool_content = _process_tool_result(
                                 agent, messages, parsed_calls, results,
                                 effective_task_id, _idx, tc, name, args,
                             )
+                            _pending_append[_idx] = (name, tc.id, tool_content)
                             _remaining.discard(f)
                     break
 
@@ -807,13 +832,11 @@ def execute_tool_calls_concurrent(agent, assistant_message, messages: list, effe
                                 _per_tool_timeout, True, False,
                                 parsed_calls[_idx][3],
                             )
-                            _finalize_tool_result(
+                            tool_content = _process_tool_result(
                                 agent, messages, parsed_calls, results,
                                 effective_task_id, _idx, tc, name, args,
                             )
-                            _flush_session_db_after_tool_progress(
-                                agent, messages, stage=f"timed-out tool result {name}",
-                            )
+                            _pending_append[_idx] = (name, tc.id, tool_content)
                             _remaining.discard(f)
 
                 # ── Activity heartbeat ──────────────────────────────────────
@@ -828,9 +851,22 @@ def execute_tool_calls_concurrent(agent, assistant_message, messages: list, effe
                         f"{len(_remaining)} remaining: {', '.join(_still_running[:3])})"
                     )
 
-    # Handle blocked (pre-execution-rejected) tools
-    for i, (tc, name, args, middleware_trace, block_result, blocked_by_guardrail) in enumerate(parsed_calls):
+    # ── Append all results to messages in original call order ────────
+    # The as_completed loop above processes tool results for callbacks and
+    # display but defers messages.append to this ordered pass so the
+    # conversation history sees tools in the order the model invoked them.
+    for i in range(num_tools):
+        if i in _finalized_indices:
+            continue  # already finalized+appended by shutdown error path
+        if i in _pending_append:
+            # Processed by as_completed / interrupt / timeout — just append
+            _name, _tc_id, _content = _pending_append[i]
+            _append_tool_result(agent, messages, _name, _tc_id, _content)
+            continue
+
+        tc, name, args, middleware_trace, block_result, blocked_by_guardrail = parsed_calls[i]
         if block_result is not None:
+            # Blocked tool — never entered the ThreadPool
             _emit_terminal_post_tool_call(
                 agent, function_name=name, function_args=args,
                 result=block_result, effective_task_id=effective_task_id,
@@ -842,6 +878,12 @@ def execute_tool_calls_concurrent(agent, assistant_message, messages: list, effe
             messages.append(make_tool_result_message(name, block_result, tc.id))
             _flush_session_db_after_tool_progress(
                 agent, messages, stage=f"blocked tool result {name}",
+            )
+        elif results[i] is not None:
+            # Tool completed normally but wasn't processed yet (edge case)
+            _finalize_tool_result(
+                agent, messages, parsed_calls, results,
+                effective_task_id, i, tc, name, args,
             )
     # ── Per-turn aggregate budget enforcement ─────────────────────────
     num_tools = len(parsed_calls)
